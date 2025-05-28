@@ -3,7 +3,6 @@ import re
 import requests
 from bs4 import BeautifulSoup
 import random
-import whois
 import joblib
 
 user_agents_list = [
@@ -59,62 +58,132 @@ def _req_feats(url):
         "whois_registered_domain": 0,
     }
 
-    global error
     error = ""
     try:
-        response = requests.get(url, headers={"User-Agent": random.choice(user_agents_list)}, timeout=5)
-        response.raise_for_status()
+        headers_list = [
+            {
+                "User-Agent": random.choice(user_agents_list),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Connection": "keep-alive"
+            },
+            {
+                "User-Agent": random.choice(user_agents_list),
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Connection": "close"
+            }
+        ]
 
-        soup = BeautifulSoup(response.text, 'html.parser')
-        hyperlinks = soup.find_all('a')
-        external_css_links = [link.get("href") for link in soup.find_all("link", rel="stylesheet")]
-        favicon_link = soup.find('link', rel='icon') or soup.find('link', rel='shortcut icon')
-        img_tags = soup.find_all('img')
-        video_tags = soup.find_all('video')
-        total_media_count = len(img_tags) + len(video_tags)
-        img_count = len(img_tags)
-        iframe_tags = soup.find_all('iframe')
-        title_tag = soup.find('title')
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc
+        response = None
+        for headers in headers_list:
+            try:
+                response = requests.get(url, headers=headers, timeout=5, verify=False, allow_redirects=True)
+                if response.status_code == 200:
+                    break
+            except requests.exceptions.SSLError:
+                url_http = url.replace('https://', 'http://', 1)
+                response = requests.get(url_http, headers=headers, timeout=5, verify=False, allow_redirects=True)
+                if response.status_code == 200:
+                    break
+            except Exception:
+                continue
 
-        # Robust WHOIS lookup
-        try:
-            domain_info = whois.whois(domain)
-            # Some whois servers return None or empty dict
-            if hasattr(domain_info, 'status') and domain_info.status is not None:
-                data["whois_registered_domain"] = 0
+        if response and response.status_code == 200:
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            hyperlinks = soup.find_all('a')
+            external_css_links = [link.get("href") for link in soup.find_all("link", rel="stylesheet")]
+            favicon_link = soup.find('link', rel='icon') or soup.find('link', rel='shortcut icon')
+            img_tags = soup.find_all('img')
+            video_tags = soup.find_all('video')
+            total_media_count = len(img_tags) + len(video_tags)
+            img_count = len(img_tags)
+            iframe_tags = soup.find_all('iframe')
+            title_tag = soup.find('title')
+            parsed_url = urlparse(url)
+            domain = parsed_url.netloc
+
+            try:
+                import pythonwhois
+                domain_info = pythonwhois.get_whois(domain)
+                if domain_info:
+                    data["whois_registered_domain"] = 1 if domain_info.get('status') else 0
+                else:
+                    data["whois_registered_domain"] = 0
+            except ImportError:
+                try:
+                    import whois
+                    domain_info = whois.whois(domain)
+                    if hasattr(domain_info, 'status') and domain_info.status is not None:
+                        data["whois_registered_domain"] = 0
+                    else:
+                        data["whois_registered_domain"] = 1
+                except Exception:
+                    data["whois_registered_domain"] = 0
+
+            if total_media_count > 0:
+                media_ratio = (img_count / total_media_count) * 100
             else:
-                data["whois_registered_domain"] = 1
-        except Exception as e:
-            # If whois fails, treat as unregistered (or you can set to 1 or 0 as you prefer)
-            data["whois_registered_domain"] = 1
-            error += f" WHOIS error: {e}"
+                media_ratio = 0
 
-        if total_media_count > 0:
-            media_ratio = (img_count / total_media_count) * 100
+            data["external_favicon"] = 1 if favicon_link else 0
+            data["iframe"] = 1 if iframe_tags else 0
+
+            if title_tag:
+                data["empty_title"] = 0
+                title_text = title_tag.text.strip()
+                data["domain_in_title"] = 1 if domain in title_text else 0
+            else:
+                data["empty_title"] = 1
+                data["domain_in_title"] = 0
+
+            data["domain_with_copyright"] = 1 if " " in domain else 0
+            data["nb_hyperlinks"] = len(hyperlinks)
+            data["links_in_tags"] = data["nb_hyperlinks"]
+            data["nb_extCSS"] = len(external_css_links)
+            data["ratio_intMedia"] = media_ratio
+
         else:
-            media_ratio = 0
+            data.update({
+                "nb_hyperlinks": 0,
+                "nb_extCSS": 0,
+                "external_favicon": 0,
+                "links_in_tags": 0,
+                "ratio_intMedia": 0,
+                "iframe": 0,
+                "empty_title": 1,
+                "domain_in_title": 0,
+                "domain_with_copyright": 0,
+                "whois_registered_domain": 0
+            })
+            
+            data["nb_redirection"] = 1  
+            data["shortening_service"] = 1  
+            data["ip"] = 1  
+            
+            error = "Phishing"
 
-        data["external_favicon"] = 1 if favicon_link else 0
-        data["iframe"] = 1 if iframe_tags else 0
-
-        if title_tag:
-            data["empty_title"] = 0
-            title_text = title_tag.text.strip()
-            data["domain_in_title"] = 1 if domain in title_text else 0
-        else:
-            data["empty_title"] = 1
-            data["domain_in_title"] = 0
-
-        data["domain_with_copyright"] = 1 if "©" in domain else 0
-        data["nb_hyperlinks"] = len(hyperlinks)
-        data["links_in_tags"] = data["nb_hyperlinks"]
-        data["nb_extCSS"] = len(external_css_links)
-        data["ratio_intMedia"] = media_ratio
-
-    except requests.exceptions.RequestException as e:
-        error = str(e)
+    except Exception as e:
+        data.update({
+            "nb_hyperlinks": 0,
+            "nb_extCSS": 0,
+            "external_favicon": 0,
+            "links_in_tags": 0,
+            "ratio_intMedia": 0,
+            "iframe": 0,
+            "empty_title": 1,
+            "domain_in_title": 0,
+            "domain_with_copyright": 0,
+            "whois_registered_domain": 0
+        })
+        
+        data["nb_redirection"] = 1
+        data["shortening_service"] = 1
+        data["ip"] = 1
+        
+        error = "Phishing"
 
     return data, error
 
@@ -190,14 +259,13 @@ def url_prep(url):
 import warnings
 import sys
 import os
-from sklearn.exceptions import InconsistentVersionWarning
+from sklearn.exceptions import DataConversionWarning, DataDimensionalityWarning
 
-# Suppress version mismatch warnings
-warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+warnings.filterwarnings("ignore", category=DataConversionWarning)
+warnings.filterwarnings("ignore", category=DataDimensionalityWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Initialize model as None
 model = None
 
 def load_model():
@@ -245,7 +313,6 @@ def load_model():
     print("Failed to load model with all available methods")
     sys.exit(1)
 
-# Load the model when the module is imported
 load_model()
 
 def get_model():
